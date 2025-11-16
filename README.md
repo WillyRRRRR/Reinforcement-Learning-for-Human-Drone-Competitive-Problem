@@ -1,6 +1,10 @@
+This project references the following article:
+
+Jiaohong Xie, Yang Liu, and Nan Chen. "Two-Sided Deep Reinforcement Learning for Dynamic Mobility-on-Demand Management with Mixed Autonomy." Transportation Science, 2023, 57(4): 1019–1046.
+
 # Reinforcement Learning Courier-Drone Project
 
-This repository contains a simulation environment and core components for a 2 sided reinforcement learning-based algorithm. The project is organized around five main Python files, each responsible for a key part of the system:
+This repository contains a simulation environment and core components for a 2 sided reinforcement learning-based algorithm. The project is organized around five main Python files, each responsible for a key part of the system.:
 
 ## Project Structure
 
@@ -24,10 +28,10 @@ This repository contains a simulation environment and core components for a 2 si
 - **network.py**  
   Implements the courier (delivery agent) logic, including state observation, action selection, and interaction with the environment.
 
-- **ppo.py**  
-  Contains the PPO training loop, including loss calculation, model updates, and checkpointing.
+- **ppo2.py**  
+  Contains the PPO united training loop, including loss calculation, model updates, and checkpointing.
 
-- **virtual_env.py**  
+- **env.py**  
   Builds the simulated delivery environment, including order generation, task assignment, and feedback mechanisms for the agent.
 
 ## Getting Started
