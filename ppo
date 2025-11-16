@@ -1,0 +1,482 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from torch.distributions import Categorical
+import gymnasium as gym
+import torch.nn.functional as F
+from network import TwoHeadActor, TwoHeadCritic, TwoHeadMemory
+from dnetwork import DriverActor, DriverCritic, DriverMemory
+from env import OrderEnvironment
+
+# Use GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Training hyperparameters
+lr = 3e-4                # Learning rate
+gamma = 0.99             # Discount factor (PPO)
+lam = 0.95               # GAE lambda (PPO)
+eps_clip = 0.2           # PPO clipping parameter
+K_epochs = 10            # Number of PPO update epochs per batch
+BATCH_SIZE = 64          # Minibatch size
+
+env = OrderEnvironment()
+
+
+class PPOTwoHeadAgent:
+    def __init__(self, state_size, action_size_relocation, action_size_cf):
+        self.state_size = state_size
+        self.action_size_relocation = action_size_relocation
+        self.action_size_cf = action_size_cf
+
+        # Initialize networks
+        self.policy = TwoHeadActor(state_size, action_size_relocation, action_size_cf).to(device)
+        self.critic = TwoHeadCritic(state_size).to(device)
+        
+        self.policy_old = TwoHeadActor(state_size, action_size_relocation, action_size_cf).to(device)
+        self.critic_old = TwoHeadCritic(state_size).to(device)
+
+        self.memory = TwoHeadMemory()
+
+        # Optimizer: jointly updates actor and critic
+        self.optimizer = optim.Adam(
+            list(self.policy.parameters()) + list(self.critic.parameters()), 
+            lr=lr
+        )
+        
+        self.MseLoss = nn.MSELoss()
+
+        # Synchronize old policy with current policy
+        self.update_policy_parameters()
+
+    def update_policy_parameters(self):
+        """Copy current policy/critic parameters to the old ones."""
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.critic_old.load_state_dict(self.critic.state_dict())
+
+    @torch.no_grad()
+    def select_action(self, state):
+        """
+        Select actions based on current state, and record log probabilities and state value.
+        """
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)  # (1, state_size)
+
+        # Get action probabilities from the old policy
+        relocation_probs, cf_probs = self.policy_old(state_tensor)
+        reloc_dist = Categorical(probs=relocation_probs)
+        cf_dist = Categorical(probs=cf_probs)
+
+        # Sample actions
+        relocation_action = reloc_dist.sample()  # scalar tensor
+        cf_action = cf_dist.sample()
+
+        # Record log probabilities
+        relocation_logprob = reloc_dist.log_prob(relocation_action)
+        cf_logprob = cf_dist.log_prob(cf_action)
+
+        # Get state value V(s_t)
+        state_value = self.critic_old(state_tensor).squeeze()
+
+        # Store time-step t data
+        self.memory.push_t(
+            state=state.copy(),
+            relocation_action=relocation_action.item(),
+            cf_action=cf_action.item(),
+            relocation_logprob=relocation_logprob.item(),
+            cf_logprob=cf_logprob.item(),
+            state_value=state_value.item()
+        )
+
+        return relocation_action.item(), cf_action.item()
+
+    def compute_gae(self, values, next_values, rewards, is_dones, gamma, lam):
+        """
+        Compute Generalized Advantage Estimation (GAE).
+        values: V(s_t)
+        next_values: V(s_{t+1})
+        rewards: r_t
+        is_dones: done_t
+        """
+        gae = 0
+        advantages = []
+        returns = []
+
+        # Compute GAE backward in time
+        for t in reversed(range(len(rewards))):
+            if is_dones[t]:
+                delta = rewards[t] - values[t]
+            else:
+                delta = rewards[t] + gamma * next_values[t] - values[t]
+            gae = delta + gamma * lam * (1 - is_dones[t]) * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        return advantages
+
+    def update(self):
+        if len(self.memory.rewards) == 0:
+            return
+
+        # Retrieve all stored data
+        (
+            states,
+            reloc_acts,
+            cf_acts,
+            rewards,
+            next_states,
+            is_dones,
+            reloc_logprobs,
+            cf_logprobs,
+            state_values,
+        ) = self.memory.sample()
+
+        with torch.no_grad():
+            # Compute value of next states V(s_{t+1}) for GAE
+            next_state_values = self.critic_old(next_states).squeeze()
+
+            # Compute GAE advantages
+            advantages = self.compute_gae(
+                values=state_values,
+                next_values=next_state_values,
+                rewards=rewards,
+                is_dones=is_dones,
+                gamma=gamma,
+                lam=lam
+            )
+            # Compute target returns: R = A + V(s_t)
+            returns = advantages + state_values
+
+        # Minibatch updates
+        batch_size = len(rewards)
+        indices = np.arange(batch_size)
+
+        for _ in range(K_epochs):
+            np.random.shuffle(indices)
+            minibatch_size = 64  # Fixed minibatch size
+
+            for start in range(0, batch_size, minibatch_size):
+                end = min(start + minibatch_size, batch_size)
+                idx = indices[start:end]
+
+                # Extract minibatch
+                mb_states = states[idx]
+                mb_reloc_acts = reloc_acts[idx]
+                mb_cf_acts = cf_acts[idx]
+                mb_advantages = advantages[idx]
+                mb_returns = returns[idx]
+                mb_reloc_logprobs = reloc_logprobs[idx]
+                mb_cf_logprobs = cf_logprobs[idx]
+
+                # Current policy outputs
+                curr_reloc_probs, curr_cf_probs = self.policy(mb_states)
+                reloc_dist = Categorical(probs=curr_reloc_probs)
+                cf_dist = Categorical(probs=curr_cf_probs)
+
+                # Log probabilities of current actions
+                curr_reloc_logprobs = reloc_dist.log_prob(mb_reloc_acts)
+                curr_cf_logprobs = cf_dist.log_prob(mb_cf_acts)
+
+                # Policy ratios
+                reloc_ratios = torch.exp(curr_reloc_logprobs - mb_reloc_logprobs)
+                cf_ratios = torch.exp(curr_cf_logprobs - mb_cf_logprobs)
+
+                # Clipped surrogate loss
+                reloc_surr1 = reloc_ratios * mb_advantages
+                reloc_surr2 = torch.clamp(reloc_ratios, 1 - eps_clip, 1 + eps_clip) * mb_advantages
+                reloc_loss = -torch.min(reloc_surr1, reloc_surr2).mean()
+
+                cf_surr1 = cf_ratios * mb_advantages
+                cf_surr2 = torch.clamp(cf_ratios, 1 - eps_clip, 1 + eps_clip) * mb_advantages
+                cf_loss = -torch.min(cf_surr1, cf_surr2).mean()
+
+                # Entropy regularization
+                entropy = reloc_dist.entropy().mean() + cf_dist.entropy().mean()
+
+                policy_loss = reloc_loss + cf_loss - 0.01 * entropy
+
+                # Critic loss
+                value_preds = self.critic(mb_states).squeeze()
+                value_loss = self.MseLoss(value_preds, mb_returns)
+
+                # Total loss
+                loss = policy_loss + 0.5 * value_loss
+
+                # Backpropagation
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
+                self.optimizer.step()
+
+        # Update old policy
+        self.update_policy_parameters()
+        self.memory.clear_memory()
+
+
+class PPODriverAgent:
+    def __init__(self, obs_size, mean_action_size, action_size):
+        self.policy = DriverActor(obs_size, mean_action_size, action_size).to(device)
+        self.critic = DriverCritic(obs_size, mean_action_size).to(device)
+
+        self.policy_old = DriverActor(obs_size, mean_action_size, action_size).to(device)
+        self.critic_old = DriverCritic(obs_size, mean_action_size).to(device)
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.critic_old.load_state_dict(self.critic.state_dict())
+
+        self.optimizer = optim.Adam([
+            {'params': self.policy.parameters(), 'lr': lr},
+            {'params': self.critic.parameters(), 'lr': lr}
+        ])
+
+        self.memory = DriverMemory()
+        self.MseLoss = nn.MSELoss()
+
+    def select_action(self, obs, mean_action):
+        """
+        obs: np.array or list, shape: (obs_size,)
+        mean_action: scalar or float
+        """
+        obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(device)  # [1, obs_size]
+        mean_action_tensor = torch.FloatTensor([[mean_action]]).to(device)  # [1, 1]
+
+        with torch.no_grad():
+            action_probs = self.policy_old(obs_tensor, mean_action_tensor)  # [1, action_size]
+            dist = Categorical(probs=action_probs)
+            action = dist.sample()  # [1]
+            action_logprob = dist.log_prob(action)  # [1]
+            state_value = self.critic_old(obs_tensor, mean_action_tensor)  # [1, 1]
+
+        action_item = action.item()
+        logprob_item = action_logprob.item()
+        value_item = state_value.item()
+
+        # Store t-step info; reward is a placeholder (will be updated after env.step)
+        self.memory.push_t(
+            obs=obs,
+            mean_action=mean_action,
+            action=action_item,
+            reward=0.0,  # Placeholder; will be overwritten later
+            obs_value=value_item,
+            logprob=logprob_item
+        )
+
+        return action_item
+
+    def update(self):
+        if len(self.memory.rewards) == 0:
+            return
+
+        # Convert stored lists to tensors
+        (
+            old_observations,
+            old_mean_actions,
+            old_actions,
+            rewards,
+            old_obs_values,
+            old_logprobs,
+            next_observations,
+            next_mean_actions,
+            is_dones,
+            next_obs_values
+        ) = self.memory.sample()
+
+        # ==================
+        # Compute GAE advantages
+        # ==================
+        with torch.no_grad():
+            # TD error: δ_t = r_t + γ * V(s_{t+1}) * (1 - done) - V(s_t)
+            deltas = rewards + gamma * next_obs_values.squeeze() * (1 - is_dones) - old_obs_values.squeeze()
+
+            # GAE: A_t = Σ (γλ)^l * δ_{t+l}
+            advantages = []
+            gae = 0.0
+            for delta, done in zip(reversed(deltas.cpu().numpy()), reversed(is_dones.cpu().numpy())):
+                gae = delta + gamma * lam * (1 - done) * gae
+                advantages.insert(0, gae)
+            advantages = torch.tensor(advantages, dtype=torch.float32).to(device)
+
+            # Target values for value loss
+            returns = advantages + old_obs_values.squeeze()
+
+        # ==================
+        # Multiple policy updates
+        # ==================
+        for _ in range(K_epochs):
+            # Current policy output
+            action_probs = self.policy(old_observations, old_mean_actions)
+            dist = Categorical(probs=action_probs)
+            cur_logprobs = dist.log_prob(old_actions)
+            dist_entropy = dist.entropy().mean()
+
+            # Current critic estimate
+            state_values = self.critic(old_observations, old_mean_actions).squeeze()
+
+            # PPO ratio
+            ratios = torch.exp(cur_logprobs - old_logprobs)
+
+            # PPO loss
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - eps_clip, 1 + eps_clip) * advantages
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value loss
+            value_loss = self.MseLoss(state_values, returns)
+
+            # Total loss
+            loss = policy_loss + 0.5 * value_loss - 0.01 * dist_entropy
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+        # Update old networks
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.critic_old.load_state_dict(self.critic.state_dict())
+
+        # Clear memory
+        self.memory.clear_memory()
+
+
+def train_joint():
+    # Initialize environment
+    env = OrderEnvironment()
+    
+    # Get dimension info
+    state_size = env.state_size
+    action_size_relocation = env.action_size_relocation
+    action_size_cf = env.action_size_cf
+    obs_size = env.driver_obs_size
+    mean_action_size = env.mean_action_size
+    
+    # Create two agents (standard PPO structure)
+    supervisor_agent = PPOTwoHeadAgent(
+        state_size, 
+        action_size_relocation, 
+        action_size_cf
+    )
+    driver_agent = PPODriverAgent(
+        obs_size, 
+        mean_action_size, 
+        action_size_relocation
+    )
+    
+    # Training parameters
+    max_episodes = 200
+    max_timesteps = 100
+    update_timestep = 1000
+    timestep = 0
+    episode_rewards = []
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print(f"Starting joint training... (Device: {device})")
+
+    for i_episode in range(max_episodes):
+        state, info = env.reset()
+        total_reward = 0.0
+        done = False
+
+        for t in range(max_timesteps):
+            timestep += 1
+
+            # === Step 1: Platform decision (Supervisor Agent) ===
+            relocation_action, cf_action = supervisor_agent.select_action(state)
+            
+            # === Step 2: Driver decisions (Driver Agents) ===
+            driver_actions = []
+            for driver in env.drivers:
+                if driver.status == 'idle':
+                    # Get driver observation
+                    obs = env.get_driver_observation(driver, env.current_time, env.grid_ids)
+                    # Use average commission fee rates as mean-field input
+                    mean_action = np.array([env.cf_rates[grid] for grid in env.grid_ids])
+                    action = driver_agent.select_action(obs, mean_action)
+                    driver_actions.append(action)
+                else:
+                    driver_actions.append(-1)  # Invalid action (non-idle)
+
+            # === Step 3: Execute actions ===
+            action = {
+                'av_relocation': int(relocation_action),       # Target grid index for AV
+                'cf_action': cf_action,                        # Commission fee rate vector
+                'cv_actions': driver_actions                   # List of driver actions
+            }
+            
+            next_state, reward, done, info = env.step(action)
+            
+            # === Step 4: Store experiences ===
+            # 1. Store platform experience
+            supervisor_agent.memory.push_t(
+                state=state,
+                relocation_action=relocation_action,
+                cf_action=cf_action,
+                relocation_logprob=0.0,  # Placeholder — should come from select_action
+                cf_logprob=0.0,          # Same note as above
+                state_value=0.0          # Placeholder — should be recorded during select_action
+            )
+            supervisor_agent.memory.push_tt(
+                reward=reward,
+                next_state=next_state,
+                done=done,
+                next_state_value=0.0     # Placeholder — could be computed here or during step
+            )
+            
+            # 2. Store driver experiences (only for idle drivers)
+            for i, driver in enumerate(env.drivers):
+                if driver.status != 'idle' or driver_actions[i] == -1:
+                    continue
+                    
+                # Get driver observations
+                obs = env.get_driver_observation(driver, env.current_time, env.grid_ids)
+                next_obs = env.get_driver_observation(driver, env.current_time + 1, env.grid_ids)
+                
+                # Mean-field inputs
+                mean_action = np.array([env.cf_rates[grid] for grid in env.grid_ids])
+                next_mean_action = np.array([env.cf_rates[grid] for grid in env.grid_ids])
+                
+                # Note: The current implementation of DriverMemory uses push_t and push_tt separately.
+                # However, in this loop we only have partial info at time t.
+                # To match the memory interface, you may need to adjust how/when rewards are assigned.
+                # For now, we assume the reward is known immediately after step.
+
+                # Overwrite placeholder reward in memory
+                if len(driver_agent.memory.rewards) > 0:
+                    driver_agent.memory.rewards[-1] = info["driver_rewards"][i]
+
+                # Push t+1 data
+                driver_agent.memory.push_tt(
+                    next_obs=next_obs,
+                    next_mean_action=next_mean_action,
+                    done=done,
+                    next_obs_value=0.0  # Placeholder
+                )
+            
+            # Update state
+            state = next_state
+            total_reward += reward
+
+            if done:
+                break
+
+        episode_rewards.append(total_reward)
+
+        # === Periodically update agents ===
+        if timestep >= update_timestep:
+            supervisor_agent.update()
+            driver_agent.update()
+            timestep = 0
+            print(f"Episode {i_episode+1}/{max_episodes} | Reward: {total_reward:.2f}")
+
+        # Print progress
+        if (i_episode + 1) % 50 == 0:
+            avg_reward = np.mean(episode_rewards[-50:])
+            print(f"Episode {i_episode+1}, Avg Reward (last 50): {avg_reward:.2f}")
+
+    print("Joint training completed!")
+    return supervisor_agent, driver_agent, episode_rewards
+
+
+def main():
+    train_joint()
