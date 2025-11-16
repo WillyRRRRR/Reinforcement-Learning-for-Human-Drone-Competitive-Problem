@@ -1,0 +1,585 @@
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+import random
+from collections import defaultdict, deque
+import time
+import os
+
+GRID_NUM = 64  # Number of grid cells
+TIME_RANGE = 100  # Time horizon (number of time steps)
+BASE_COMMISSION_RATE = 0.2  # Base commission rate
+alpha = 1.0  # Weight for trip profit
+beta = 1.0  # Weight for commission income
+omega = 0.5  # Weight for fulfillment rate incentive
+
+ORDER_DATA_PATH = 'D:/学习资料/研究生文件/DC竞争/data/peak_hours/peak_hours_7am_11am.csv'  # Order data path
+ADJACENCY_DATA_PATH = 'D:/学习资料/研究生文件/DC竞争/data/adjacency/hex_adjacency.csv'  # Adjacency data path
+
+class OrderEnvironment:
+    class Trans:
+        """Transport agent class (courier or drone)"""
+        def __init__(self, trans_id, grid_id, is_courier=True, courier_type=None):
+            self.id = trans_id
+            self.grid_id = int(grid_id)  # Current grid location
+            self.is_courier = bool(is_courier)
+            self.status = 'idle'
+            self.current_order = None
+            self.earnings = 0.0
+            self.relocation_cost = 0.0
+            self.move_start_time = -1
+            self.delivery_start_time = -1
+            self.waiting_since = -1
+            self.current_step_earnings = 0.0  # Earnings accumulated in the current time step
+            
+            if is_courier == True:
+                if courier_type not in ['high_rational', 'low_rational']:
+                    raise ValueError(f"Invalid driver type: {courier_type}")
+                self.courier_type = courier_type
+                self.policy_threshold = 0.5 if courier_type == 'high_rational' else 0.4
+            else:
+                self.courier_type = None
+                self.policy_threshold = None
+            
+        def reset_step_cost(self):
+            """Reset earnings for the current time step"""
+            self.current_step_earnings = 0.0
+
+    class Order:
+        """Order class"""
+        def __init__(self, order_id, pickup_grid, dropoff_grid, fare, request_time):
+            self.id = order_id
+            self.pickup_grid = int(pickup_grid)
+            self.dropoff_grid = int(dropoff_grid)
+            self.fare = float(fare)
+            self.request_time = int(request_time)
+            self.status = 'waiting'
+            self.waiting_since = request_time
+            self.max_waiting_time = 1 if random.random() < 0.8 else 2
+            # Estimated travel cost (30% of fare)
+            self.estimated_travel_cost = fare * 0.3
+
+    def calculate_commission_rate(ds_ratio: float, c_it: float, base_rate: float = BASE_COMMISSION_RATE) -> float:
+        """Dynamic commission rate calculation"""
+        if ds_ratio <= 1:
+            return min(c_it * (1 - ds_ratio) + base_rate, 0.8)  # Cap max commission at 80%
+        return base_rate
+
+    def load_data(self):
+        """Load order and adjacency data (using pandas for efficiency)"""
+        order_df = pd.read_csv(ORDER_DATA_PATH)
+        adjacency_df = pd.read_csv(ADJACENCY_DATA_PATH)
+        return order_df, adjacency_df
+
+    def calculate_grid_demand(self, order_df):
+        """Compute demand per grid (vectorized)"""
+        grid_demand = order_df['pickup_hex_index'].value_counts().to_dict()
+        all_grids = set(order_df['pickup_hex_index'].unique()) | set(order_df['dropoff_hex_index'].unique())
+        for grid in all_grids:
+            grid_demand.setdefault(grid, 1)  # Ensure every grid has at least demand=1
+        return grid_demand
+
+    def build_adjacency_graph(self, adjacency_df):
+        """Build adjacency graph dictionary (pre-compiled)"""
+        adjacency_graph = {}
+        for _, row in adjacency_df.iterrows():
+            hex_index = row['hex_index']
+            adjacent_hexes = list(map(int, row['adjacent_hexes'].split(',')))
+            adjacency_graph[hex_index] = adjacent_hexes
+        return adjacency_graph
+
+    def initialize_trans(self, grid_demand, fleet_size=6000, drone_ratio=0.5, hr_ratio=0.5):
+        """Initialize transport agents (vectorized initialization)"""
+        total_demand = sum(grid_demand.values())
+        grid_ids = list(grid_demand.keys())
+        grid_probs = [grid_demand[gid]/total_demand for gid in grid_ids]
+        
+        trans = []
+        num_drone = int(fleet_size * drone_ratio)
+        num_courier = fleet_size - num_drone
+        
+        # Initialize drones
+        drone_grids = np.random.choice(grid_ids, size=num_drone, p=grid_probs)
+        for i, grid_id in enumerate(drone_grids):
+            trans.append(self.Trans(f"DR_{i}", grid_id, is_courier=False))
+        
+        # Initialize couriers
+        courier_grids = np.random.choice(grid_ids, size=num_courier, p=grid_probs)
+        for i, grid_id in enumerate(courier_grids):
+            courier_type = 'high_rational' if random.random() < hr_ratio else 'low_rational'
+            trans.append(self.Trans(f"CO_{i}", grid_id, is_courier=True, courier_type=courier_type))
+        
+        return trans
+
+    def create_orders_from_data(self, order_df, time_step):
+        """Create orders for the current time step (vectorized)"""
+        orders = []
+        current_orders = order_df[order_df['time_step'] == time_step]
+        
+        for idx, row in current_orders.iterrows():
+            order_id = f"{time_step}_{idx}"
+            orders.append(self.Order(
+                order_id=order_id,
+                pickup_grid=row['pickup_hex_index'],
+                dropoff_grid=row['dropoff_hex_index'],
+                fare=row['total_amount'],
+                request_time=row['time_step']
+            ))
+        return orders
+
+    def calculate_ds_ratio(self, demand, supply):
+        """Calculate demand-supply ratio (JIT-friendly)"""
+        return demand / max(supply, 1)  # Avoid division by zero
+
+    def four_step_matching(self, orders, trans, adjacency_graph, current_time, cf_rates):
+        """Four-step matching algorithm (optimized)"""
+        matches = []
+        matched_orders = set()
+        matched_trans = set()
+        
+        # Accelerate lookup using dictionaries
+        idle_trans_by_grid = defaultdict(lambda: {'CO': [], 'DR': []})
+        for tran in trans:
+            if tran.status == 'idle':
+                key = 'CO' if tran.is_courier else 'DR'
+                idle_trans_by_grid[tran.grid_id][key].append(tran)
+        
+        orders_by_grid = defaultdict(list)
+        for order in orders:
+            if order.status == 'waiting':
+                orders_by_grid[order.pickup_grid].append(order)
+        
+        # Sort orders by request time and descending fare
+        for grid_id, order_list in orders_by_grid.items():
+            order_list.sort(key=lambda o: (o.request_time, -o.fare))
+        
+        # Step 1: Match CO (couriers) within the same grid
+        for grid_id in list(orders_by_grid.keys()):
+            if grid_id not in idle_trans_by_grid:
+                continue
+                
+            co_trans = idle_trans_by_grid[grid_id]['CO']
+            order_list = orders_by_grid[grid_id]
+            
+            for order in order_list[:]:
+                if not co_trans:
+                    break
+                    
+                tran = co_trans.pop(0)
+                commission = order.fare * cf_rates.get(grid_id, BASE_COMMISSION_RATE)
+                courier_earning = order.fare - commission - order.estimated_travel_cost
+                drone_profit = 0.0
+                
+                matches.append((order.id, tran.id, courier_earning, commission, drone_profit))
+                matched_orders.add(order.id)
+                matched_trans.add(tran.id)
+                order_list.remove(order)
+                
+                order.status = 'matched'
+                tran.status = 'moving_to_pickup'
+                tran.current_order = order
+                tran.move_start_time = current_time
+                tran.earnings += courier_earning
+                tran.current_step_earnings += courier_earning
+        
+        # Step 2: Match DR (drones) within the same grid
+        for grid_id in list(orders_by_grid.keys()):
+            drone_trans = idle_trans_by_grid[grid_id]['DR']
+            order_list = orders_by_grid[grid_id]
+            
+            for order in order_list[:]:
+                if not drone_trans:
+                    break
+                    
+                tran = drone_trans.pop(0)
+                commission = 0.0
+                courier_earning = 0.0
+                av_profit = order.fare - order.estimated_travel_cost
+                
+                matches.append((order.id, tran.id, courier_earning, commission, av_profit))
+                matched_orders.add(order.id)
+                matched_trans.add(tran.id)
+                order_list.remove(order)
+                
+                order.status = 'matched'
+                tran.status = 'moving_to_pickup'
+                tran.current_order = order
+                tran.move_start_time = current_time
+                tran.earnings += av_profit
+                tran.current_step_earnings += av_profit
+        
+        # Step 3: Match CO from neighboring grids
+        for grid_id in list(orders_by_grid.keys()):
+            order_list = orders_by_grid[grid_id]
+            if not order_list:
+                continue
+                
+            neighbor_grids = adjacency_graph.get(grid_id, [])
+            neighbor_grids.append(grid_id)
+            
+            neighbor_courier = []
+            for neighbor in neighbor_grids:
+                neighbor_courier.extend(idle_trans_by_grid.get(neighbor, {}).get('CO', []))
+            
+            for order in order_list[:]:
+                if not neighbor_courier:
+                    break
+                    
+                tran = neighbor_courier.pop(0)
+                commission = order.fare * cf_rates.get(grid_id, BASE_COMMISSION_RATE)
+                courier_earning = order.fare - commission - order.estimated_travel_cost
+                drone_profit = 0.0
+                
+                matches.append((order.id, tran.id, courier_earning, commission, drone_profit))
+                matched_orders.add(order.id)
+                matched_trans.add(tran.id)
+                order_list.remove(order)
+                
+                order.status = 'matched'
+                tran.status = 'moving_to_pickup'
+                tran.current_order = order
+                tran.move_start_time = current_time
+                tran.earnings += courier_earning
+                tran.current_step_earnings += courier_earning
+                
+                # Remove from original grid's idle list
+                if tran in idle_trans_by_grid[tran.grid_id]['CO']:
+                    idle_trans_by_grid[tran.grid_id]['CO'].remove(tran)
+        
+        # Step 4: Match DR from neighboring grids
+        for grid_id in list(orders_by_grid.keys()):
+            order_list = orders_by_grid[grid_id]
+            if not order_list:
+                continue
+                
+            neighbor_grids = adjacency_graph.get(grid_id, [])
+            neighbor_grids.append(grid_id)
+            
+            neighbor_drone = []
+            for neighbor in neighbor_grids:
+                neighbor_drone.extend(idle_trans_by_grid.get(neighbor, {}).get('DR', []))
+            
+            for order in order_list[:]:
+                if not neighbor_drone:
+                    break
+                    
+                tran = neighbor_drone.pop(0)
+                commission = 0.0
+                courier_earning = 0.0
+                drone_profit = order.fare - order.estimated_travel_cost
+                
+                matches.append((order.id, tran.id, courier_earning, commission, drone_profit))
+                matched_orders.add(order.id)
+                matched_trans.add(tran.id)
+                order_list.remove(order)
+                
+                order.status = 'matched'
+                tran.status = 'moving_to_pickup'
+                tran.current_order = order
+                tran.move_start_time = current_time
+                tran.earnings += drone_profit
+                tran.current_step_earnings += drone_profit
+                
+                # Remove from original grid's idle list
+                if tran in idle_trans_by_grid[tran.grid_id]['DR']:
+                    idle_trans_by_grid[tran.grid_id]['DR'].remove(tran)
+        
+        return matches
+
+    def update_vehicle_status(self, trans, current_time):
+        """
+        Update vehicle status (assume both relocation and delivery take 1 time step)
+
+        Args:
+            trans: List of Trans objects
+            current_time: Current time step (int)
+        """
+        for tran in trans:
+            # 1. Handle "relocation": moving to a target grid
+            if tran.status == 'moving_to_grid':
+                if tran.move_start_time == current_time - 1:
+                    tran.status = 'idle'
+                    tran.move_start_time = None
+                    tran.current_step_earnings = 0.0
+
+            # 2. Handle "moving to pickup"
+            elif tran.status == 'moving_to_pickup':
+                if tran.move_start_time == current_time - 1:
+                    tran.status = 'delivering'
+                    tran.delivery_start_time = current_time
+
+            # 3. Handle "delivering"
+            elif tran.status == 'delivering':
+                if tran.delivery_start_time == current_time - 1:
+                    tran.status = 'idle'
+                    tran.current_order = None
+                    tran.delivery_start_time = None
+                    tran.reset_step_cost()
+
+    def get_system_state(self, trans, orders, current_time, grid_ids):
+        """
+        Construct system state vector, strictly following formula (1) in the paper.
+
+        Returns:
+            state_vector: np.array, shape = (2*N + N^2 + T,)
+        """
+        N = len(grid_ids)
+        T = TIME_RANGE
+        total_dims = 2 * N + N * N + T
+        state_vector = np.zeros(total_dims, dtype=np.float32)
+
+        # Map grid ID to index
+        grid_index_map = {gid: idx for idx, gid in enumerate(grid_ids)}
+
+        # === 1. AV distribution V^a_t (first N dimensions) ===
+        drone_count = np.zeros(N, dtype=np.float32)
+        for tran in trans:
+            if tran.status == 'idle' and tran.grid_id in grid_index_map and not tran.is_courier:
+                idx = grid_index_map[tran.grid_id]
+                drone_count[idx] += 1
+        state_vector[:N] = drone_count
+
+        # === 2. CV distribution V^c_t (next N dimensions) ===
+        cv_count = np.zeros(N, dtype=np.float32)
+        for tran in trans:
+            if tran.status == 'idle' and tran.grid_id in grid_index_map and tran.is_courier:
+                idx = grid_index_map[tran.grid_id]
+                cv_count[idx] += 1
+        state_vector[N:2*N] = cv_count
+
+        # === 3. Demand matrix D_t (N×N dimensions) ===
+        demand_matrix = np.zeros((N, N), dtype=np.float32)
+        for order in orders:
+            if order.status == 'waiting':
+                origin_idx = grid_index_map.get(order.pickup_grid)
+                dest_idx = grid_index_map.get(order.dropoff_grid)
+                if origin_idx is not None and dest_idx is not None:
+                    demand_matrix[origin_idx, dest_idx] += 1
+        state_vector[2*N:2*N + N*N] = demand_matrix.flatten()
+
+        # === 4. One-hot time encoding (last T dimensions) ===
+        time_encoding_start = 2 * N + N * N
+        if 0 <= current_time < T:
+            state_vector[time_encoding_start + current_time] = 1.0
+        else:
+            print(f"[Warning] current_time={current_time} not in [0, {T}), using t=0")
+            state_vector[time_encoding_start] = 1.0
+
+        return state_vector
+
+    def get_driver_observation(self, tran, current_time, grid_ids, time_steps=TIME_RANGE):
+        N = len(grid_ids)
+        T = time_steps
+        observation = np.zeros(N + T, dtype=np.float32)
+        
+        if tran.grid_id in grid_ids:
+            grid_index = grid_ids.index(tran.grid_id)
+            observation[grid_index] = 1.0  # One-hot grid encoding
+        else:
+            print(f"Warning: grid_id {tran.grid_id} not found in grid_ids")
+        
+        observation[N + current_time] = 1.0  # One-hot time encoding
+
+        return observation
+
+    def get_platform_reward(self):
+        """Compute platform reward based on current time step earnings"""
+        total_trip_profit = 0.0      # gA_t
+        total_commission = 0.0       # CF A_t
+        fulfilled_order_count = 0    # Number of matched orders
+        total_order_count = len([o for o in self.orders if o.status == 'waiting'])  # Total waiting orders
+
+        for tran in self.trans:
+            if tran.current_step_earnings > 0:
+                total_trip_profit += tran.current_step_earnings
+                commission = tran.current_step_earnings * BASE_COMMISSION_RATE
+                total_commission += commission
+                fulfilled_order_count += 1
+
+        fulfillment_rate = (fulfilled_order_count / total_order_count) if total_order_count > 0 else 0.0
+
+        reward = (
+            alpha * total_trip_profit +
+            beta * total_commission +
+            omega * fulfillment_rate * total_order_count
+        ) / self.N
+
+        return reward
+
+    def is_done(self, current_time: int) -> bool:
+        """Check if the episode is finished"""
+        return current_time >= TIME_RANGE 
+
+    def calculate_mean_action(self) -> np.ndarray:
+        """
+        Compute supply-demand ratio per grid as mean_action vector.
+        
+        mean_action[i] = supply_i / demand_i
+        
+        Used as input for driver_agent to reflect market congestion.
+
+        Returns:
+            np.ndarray: Shape (N,), supply-demand ratio per grid
+        """
+        N = len(self.grid_ids)
+        supply = np.zeros(N)  # Idle couriers per grid
+        demand = np.zeros(N)  # Waiting orders per grid (by pickup)
+
+        for tran in self.trans:
+            if tran.status == 'idle' and tran.is_courier:
+                grid_idx = self.grid_to_index[tran.grid_id]
+                supply[grid_idx] += 1
+
+        for order in self.orders:
+            if order.status == 'waiting':
+                grid_idx = self.grid_to_index[order.pickup_grid]
+                demand[grid_idx] += 1
+
+        epsilon = 1e-6
+        mean_action = supply / (demand + epsilon)
+
+        return mean_action
+
+    def __init__(self):
+        # Load data
+        self.order_df, self.adjacency_df = self.load_data()
+        
+        # Initialize grid demand
+        self.grid_demand = self.calculate_grid_demand(self.order_df)
+        self.grid_ids = sorted(self.grid_demand.keys())
+        self.N = len(self.grid_ids)
+        
+        # Grid ID to index mapping
+        self.grid_to_index = {gid: idx for idx, gid in enumerate(self.grid_ids)}
+        
+        # Build adjacency graph
+        self.adjacency_graph = self.build_adjacency_graph(self.adjacency_df)
+        
+        # Initialize system state
+        self.current_time = 0
+        self.trans = self.initialize_trans(self.grid_demand)
+        self.orders = []
+        self.cf_rates = {grid: BASE_COMMISSION_RATE for grid in self.grid_ids}
+        self.drivers = [t for t in self.trans if t.is_courier]
+        self.av_list = [t for t in self.trans if not t.is_courier]
+        
+        # Environment dimensions
+        self.state_size = 2 * self.N + self.N * self.N + TIME_RANGE
+        self.driver_obs_size = self.N + TIME_RANGE
+        self.action_size_relocation = self.N
+        self.action_size_cf = self.N
+        self.mean_action_size = self.N
+
+    def reset(self):
+        """Reset environment and return initial state"""
+        self.current_time = 0
+        self.trans = self.initialize_trans(self.grid_demand)
+        self.orders = []
+        self.cf_rates = {grid: BASE_COMMISSION_RATE for grid in self.grid_ids}
+        self.drivers = [t for t in self.trans if t.is_courier]
+        self.av_list = [t for t in self.trans if not t.is_courier]
+        
+        # Generate initial orders
+        initial_orders = self.create_orders_from_data(self.order_df, 0)
+        self.orders.extend(initial_orders)
+        
+        # Perform initial matching
+        if self.orders:
+            self.four_step_matching(
+                self.orders, 
+                self.trans, 
+                self.adjacency_graph, 
+                self.current_time, 
+                self.cf_rates
+            )
+        
+        # Reset step earnings
+        for tran in self.trans:
+            tran.reset_step_cost()
+        
+        # Build initial state
+        state = self.get_system_state(
+            self.trans, 
+            self.orders, 
+            self.current_time, 
+            self.grid_ids
+        )
+        return state, {"time": self.current_time}
+
+    def step(self, action):
+        """Execute action and advance environment state
+        
+        Args:
+            action: {
+                'av_relocation': int (target grid index),
+                'cf_action': np.array (length=N, commission rates per grid),
+                'cv_actions': list (relocation actions for each courier, length=len(drivers))
+            }
+        
+        Returns:
+            next_state: np.array, system state
+            reward: float, platform reward
+            done: bool, whether episode is done
+            info: dict, additional info
+        """
+        # =============== 1. Process platform actions ===============
+        av_target_grid_idx = action['av_relocation']
+        cf_action = action['cf_action']
+        
+        # Update commission rates
+        for idx, grid in enumerate(self.grid_ids):
+            self.cf_rates[grid] = cf_action[idx]
+        
+        # Relocate drones
+        for av in self.av_list:
+            av.grid_id = self.grid_ids[av_target_grid_idx]
+            av.status = 'moving_to_grid'
+            av.move_start_time = self.current_time
+        
+        # =============== 2. Process courier actions ===============
+        for i, driver in enumerate(self.drivers):
+            if driver.status != 'idle':
+                continue
+                
+            target_grid_idx = action['cv_actions'][i]
+            target_grid = self.grid_ids[target_grid_idx]
+            
+            driver.grid_id = target_grid
+            driver.status = 'moving_to_grid'
+            driver.move_start_time = self.current_time
+        
+        # =============== 3. Generate new orders ===============
+        self.orders = self.create_orders_from_data(self.order_df, self.current_time)
+        
+        # =============== 4. Perform order matching ===============
+        matches = self.four_step_matching(
+            self.orders, self.trans, 
+            self.adjacency_graph, 
+            self.current_time, 
+            self.cf_rates
+        )
+        
+        # =============== 5. Update vehicle status ===============
+        self.update_vehicle_status(self.trans, self.current_time)
+        
+        # =============== 6. Compute reward ===============
+        reward = self.get_platform_reward()
+        
+        # =============== 7. Advance time ===============
+        self.current_time += 1
+        
+        # =============== 8. Check termination ===============
+        done = self.current_time >= TIME_RANGE
+        
+        # =============== 9. Get next state ===============
+        next_state = self.get_system_state(self.trans, self.orders, self.current_time, self.grid_ids)
+        
+        # =============== 10. Build info dict ===============
+        info = {
+            "time": self.current_time,
+            "driver_rewards": [driver.earnings for driver in self.drivers],
+            "total_reward": reward,
+            "mean_action": self.calculate_mean_action()
+        }
+        
+        return next_state, reward, done, info
