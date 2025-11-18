@@ -37,8 +37,8 @@ This repository contains a simulation environment and core components for a 2 si
 ## Getting Started
 
 1. Preprocess your data using `data_process.py`.
-2. Set up the simulation environment with `virtual_env.py`.
-3. Start training the agent by running `train_ppo.py`. The agent and network definitions are located in `courier_agent.py` and `dual_head_network.py`, respectively.
+2. Set up the simulation environment with `env.py`.
+3. Start training the agent by running `ppo2.py`. The agent and network definitions are located in `network.py` and `dnetwork.py`, respectively.
 4. Review and customize parameters as needed in each script.
 
 ## Requirements
